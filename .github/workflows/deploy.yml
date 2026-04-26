@@ -58,8 +58,11 @@ jobs:
           git push --force origin deploy
 
       - name: Trigger Portainer redeploy
-        if: ${{ secrets.PORTAINER_REDEPLOY_HOOK != '' }}
         env:
           WEBHOOK_URL: ${{ secrets.PORTAINER_REDEPLOY_HOOK }}
         run: |
+          if [ -z "${WEBHOOK_URL}" ]; then
+            echo "PORTAINER_REDEPLOY_HOOK secret is not set; skipping webhook trigger."
+            exit 0
+          fi
           curl -fsSL -X POST "${WEBHOOK_URL}"
