@@ -7,10 +7,17 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf16"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
+
+// mediaGroupFlushDelay is how long to wait after the last message in a media
+// group before treating the group as complete. Telegram delivers album items
+// as separate updates ~instantly, so a short delay is enough.
+const mediaGroupFlushDelay = 2 * time.Second
 
 func main() {
 	botToken := os.Getenv("BOT_TOKEN")
@@ -43,6 +50,10 @@ func main() {
 
 	updates := bot.GetUpdatesChan(updateConfig)
 
+	groups := newMediaGroupBuffer(func(msgs []*tgbotapi.Message) {
+		processMessages(bot, msgs, outline, collectionID)
+	})
+
 	for update := range updates {
 		if update.Message == nil {
 			continue
@@ -51,68 +62,52 @@ func main() {
 			log.Printf("Unauthorized message from user ID: %d", update.Message.From.ID)
 			continue
 		}
-		processMessage(bot, update.Message, outline, collectionID)
+		if update.Message.MediaGroupID != "" {
+			groups.add(update.Message)
+			continue
+		}
+		processMessages(bot, []*tgbotapi.Message{update.Message}, outline, collectionID)
 	}
 }
 
-// processMessage turns a Telegram message into a single Outline document.
-func processMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, outline *OutlineClient, collectionID string) {
-	// rawText is plain text (used for the title); messageText carries
-	// entity-derived markdown (links, bold, etc.) for the document body.
-	rawText := message.Text
-	messageText := entitiesToMarkdown(message.Text, message.Entities)
+// processMessages collapses one or more Telegram messages (typically a media
+// group / album) into a single Outline document.
+func processMessages(bot *tgbotapi.BotAPI, messages []*tgbotapi.Message, outline *OutlineClient, collectionID string) {
+	if len(messages) == 0 {
+		return
+	}
+	// Stable order across the album.
+	sort.SliceStable(messages, func(i, j int) bool {
+		return messages[i].MessageID < messages[j].MessageID
+	})
+	primary := messages[0]
+
+	var rawTextParts, textParts, mediaParts []string
 	var forwardInfo string
-	var imageMarkdown string
 
-	if message.ForwardFrom != nil {
-		forwardInfo = fmt.Sprintf("Forwarded from: %s %s (@%s)",
-			message.ForwardFrom.FirstName,
-			message.ForwardFrom.LastName,
-			message.ForwardFrom.UserName)
-	} else if message.ForwardFromChat != nil {
-		forwardInfo = fmt.Sprintf("Forwarded from: %s", message.ForwardFromChat.Title)
-		if message.ForwardFromChat.UserName != "" {
-			forwardInfo += fmt.Sprintf(" (@%s)", message.ForwardFromChat.UserName)
+	for _, m := range messages {
+		if forwardInfo == "" {
+			forwardInfo = forwardHeader(m)
+		}
+		if m.Text != "" {
+			rawTextParts = append(rawTextParts, m.Text)
+			textParts = append(textParts, entitiesToMarkdown(m.Text, m.Entities))
+		}
+		if m.Caption != "" {
+			rawTextParts = append(rawTextParts, m.Caption)
+			textParts = append(textParts, entitiesToMarkdown(m.Caption, m.CaptionEntities))
+		}
+		if md := uploadMedia(bot, m, outline); md != "" {
+			mediaParts = append(mediaParts, md)
 		}
 	}
 
-	if message.Photo != nil {
-		// Largest size is last in the slice.
-		photoSize := message.Photo[len(message.Photo)-1]
-		fileURL, err := bot.GetFileDirectURL(photoSize.FileID)
-		if err != nil {
-			log.Printf("Failed to get photo URL: %v", err)
-		} else {
-			fileData, err := DownloadFile(fileURL)
-			if err != nil {
-				log.Printf("Failed to download photo: %v", err)
-			} else {
-				name := fmt.Sprintf("telegram-%d.jpg", message.MessageID)
-				attachmentURL, err := outline.UploadAttachment(name, "image/jpeg", fileData)
-				if err != nil {
-					log.Printf("Failed to upload photo to Outline: %v", err)
-				} else {
-					log.Printf("Photo uploaded to Outline: %s", attachmentURL)
-					imageMarkdown = fmt.Sprintf("![](%s)", attachmentURL)
-				}
-			}
-		}
-	}
+	rawText := strings.Join(rawTextParts, "\n\n")
+	messageText := strings.Join(textParts, "\n\n")
 
-	if message.Caption != "" {
-		if messageText != "" {
-			messageText += "\n\n"
-		}
-		messageText += entitiesToMarkdown(message.Caption, message.CaptionEntities)
-		if rawText != "" {
-			rawText += "\n\n"
-		}
-		rawText += message.Caption
-	}
-
-	if messageText == "" && imageMarkdown == "" && forwardInfo == "" {
-		reply := tgbotapi.NewMessage(message.Chat.ID, "Cannot add empty message to Outline.")
-		reply.ReplyToMessageID = message.MessageID
+	if messageText == "" && len(mediaParts) == 0 && forwardInfo == "" {
+		reply := tgbotapi.NewMessage(primary.Chat.ID, "Cannot add empty message to Outline.")
+		reply.ReplyToMessageID = primary.MessageID
 		bot.Send(reply)
 		return
 	}
@@ -124,28 +119,182 @@ func processMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, outline *Ou
 	if messageText != "" {
 		bodyParts = append(bodyParts, messageText)
 	}
-	if imageMarkdown != "" {
-		bodyParts = append(bodyParts, imageMarkdown)
-	}
+	bodyParts = append(bodyParts, mediaParts...)
 	body := strings.Join(bodyParts, "\n\n")
 
-	title := generateTitle(rawText, imageMarkdown != "")
+	title := generateTitle(rawText, len(mediaParts) > 0)
 
 	if _, err := outline.CreateDocument(collectionID, title, body); err != nil {
 		log.Printf("Failed to create document in Outline: %v", err)
-		reply := tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("Error adding to Outline: %v", err))
-		reply.ReplyToMessageID = message.MessageID
+		reply := tgbotapi.NewMessage(primary.Chat.ID, fmt.Sprintf("Error adding to Outline: %v", err))
+		reply.ReplyToMessageID = primary.MessageID
 		bot.Send(reply)
 		return
 	}
 
 	confirmation := "Added to Outline"
-	if imageMarkdown != "" {
-		confirmation += " with image"
+	switch {
+	case len(messages) > 1:
+		confirmation = fmt.Sprintf("Added to Outline (%d items)", len(messages))
+	case len(mediaParts) > 0:
+		confirmation += " with media"
 	}
-	reply := tgbotapi.NewMessage(message.Chat.ID, confirmation)
-	reply.ReplyToMessageID = message.MessageID
+	reply := tgbotapi.NewMessage(primary.Chat.ID, confirmation)
+	reply.ReplyToMessageID = primary.MessageID
 	bot.Send(reply)
+}
+
+func forwardHeader(m *tgbotapi.Message) string {
+	switch {
+	case m.ForwardFrom != nil:
+		return fmt.Sprintf("Forwarded from: %s %s (@%s)",
+			m.ForwardFrom.FirstName,
+			m.ForwardFrom.LastName,
+			m.ForwardFrom.UserName)
+	case m.ForwardFromChat != nil:
+		s := fmt.Sprintf("Forwarded from: %s", m.ForwardFromChat.Title)
+		if m.ForwardFromChat.UserName != "" {
+			s += fmt.Sprintf(" (@%s)", m.ForwardFromChat.UserName)
+		}
+		return s
+	}
+	return ""
+}
+
+// uploadMedia uploads any photo/video/animation/document/audio/voice attached
+// to the message and returns the markdown to embed it. Returns "" if there's
+// no recognized media or the upload failed (errors are logged).
+func uploadMedia(bot *tgbotapi.BotAPI, m *tgbotapi.Message, outline *OutlineClient) string {
+	var fileID, name, contentType string
+	isImage := false
+
+	switch {
+	case m.Photo != nil:
+		ph := m.Photo[len(m.Photo)-1]
+		fileID = ph.FileID
+		name = fmt.Sprintf("telegram-%d.jpg", m.MessageID)
+		contentType = "image/jpeg"
+		isImage = true
+	case m.Video != nil:
+		fileID = m.Video.FileID
+		contentType = firstNonEmpty(m.Video.MimeType, "video/mp4")
+		name = mediaFileName(m.Video.FileName, m.MessageID, contentType, ".mp4")
+	case m.Animation != nil:
+		fileID = m.Animation.FileID
+		contentType = firstNonEmpty(m.Animation.MimeType, "video/mp4")
+		name = mediaFileName(m.Animation.FileName, m.MessageID, contentType, ".mp4")
+	case m.Document != nil:
+		fileID = m.Document.FileID
+		contentType = firstNonEmpty(m.Document.MimeType, "application/octet-stream")
+		name = mediaFileName(m.Document.FileName, m.MessageID, contentType, "")
+		isImage = strings.HasPrefix(contentType, "image/")
+	case m.Audio != nil:
+		fileID = m.Audio.FileID
+		contentType = firstNonEmpty(m.Audio.MimeType, "audio/mpeg")
+		name = mediaFileName(m.Audio.FileName, m.MessageID, contentType, ".mp3")
+	case m.Voice != nil:
+		fileID = m.Voice.FileID
+		contentType = firstNonEmpty(m.Voice.MimeType, "audio/ogg")
+		name = fmt.Sprintf("telegram-voice-%d.ogg", m.MessageID)
+	default:
+		return ""
+	}
+
+	fileURL, err := bot.GetFileDirectURL(fileID)
+	if err != nil {
+		log.Printf("Failed to get file URL for message %d: %v", m.MessageID, err)
+		return ""
+	}
+	data, err := DownloadFile(fileURL)
+	if err != nil {
+		log.Printf("Failed to download %s: %v", name, err)
+		return ""
+	}
+	attachmentURL, err := outline.UploadAttachment(name, contentType, data)
+	if err != nil {
+		log.Printf("Failed to upload %s to Outline: %v", name, err)
+		return ""
+	}
+	log.Printf("Uploaded %s to Outline: %s", name, attachmentURL)
+	if isImage {
+		return fmt.Sprintf("![](%s)", attachmentURL)
+	}
+	return fmt.Sprintf("[%s](%s)", name, attachmentURL)
+}
+
+func mediaFileName(provided string, messageID int, contentType, fallbackExt string) string {
+	if provided != "" {
+		return provided
+	}
+	ext := fallbackExt
+	if slash := strings.IndexByte(contentType, '/'); slash >= 0 {
+		guess := "." + contentType[slash+1:]
+		// Strip any media-type parameters (e.g. "video/mp4; codecs=...").
+		if semi := strings.IndexByte(guess, ';'); semi >= 0 {
+			guess = strings.TrimSpace(guess[:semi])
+		}
+		if guess != "." {
+			ext = guess
+		}
+	}
+	return fmt.Sprintf("telegram-%d%s", messageID, ext)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// mediaGroupBuffer accumulates messages sharing a MediaGroupID and flushes
+// them as a single batch shortly after the last item arrives. Album items are
+// delivered as separate updates by Telegram.
+type mediaGroupBuffer struct {
+	mu     sync.Mutex
+	groups map[string]*pendingGroup
+	flush  func([]*tgbotapi.Message)
+}
+
+type pendingGroup struct {
+	messages []*tgbotapi.Message
+	timer    *time.Timer
+}
+
+func newMediaGroupBuffer(flush func([]*tgbotapi.Message)) *mediaGroupBuffer {
+	return &mediaGroupBuffer{
+		groups: make(map[string]*pendingGroup),
+		flush:  flush,
+	}
+}
+
+func (b *mediaGroupBuffer) add(msg *tgbotapi.Message) {
+	id := msg.MediaGroupID
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	g, ok := b.groups[id]
+	if !ok {
+		g = &pendingGroup{}
+		b.groups[id] = g
+	} else if g.timer != nil {
+		g.timer.Stop()
+	}
+	g.messages = append(g.messages, msg)
+	g.timer = time.AfterFunc(mediaGroupFlushDelay, func() {
+		b.mu.Lock()
+		pending, ok := b.groups[id]
+		if !ok {
+			b.mu.Unlock()
+			return
+		}
+		delete(b.groups, id)
+		msgs := pending.messages
+		b.mu.Unlock()
+		b.flush(msgs)
+	})
 }
 
 // entitiesToMarkdown overlays Telegram message entities onto the raw text and
@@ -212,11 +361,11 @@ func applyEntity(e tgbotapi.MessageEntity, inner string) string {
 }
 
 // generateTitle picks the first non-empty line of the message, trimmed to 80 chars.
-func generateTitle(text string, hasImage bool) string {
+func generateTitle(text string, hasMedia bool) string {
 	text = strings.TrimSpace(text)
 	if text == "" {
-		if hasImage {
-			return "Telegram photo"
+		if hasMedia {
+			return "Telegram media"
 		}
 		return "Telegram message"
 	}
