@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  tg2outline:
+    # Image tag is replaced with the commit SHA in the deploy branch by CI.
+    image: ghcr.io/korjavin/tg2outline:latest
+    container_name: tg2outline
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - TG_USER_ID=${TG_USER_ID}
+      - OUTLINE_URL=${OUTLINE_URL}
+      - OUTLINE_API_TOKEN=${OUTLINE_API_TOKEN}
+      - OUTLINE_COLLECTION_ID=${OUTLINE_COLLECTION_ID}

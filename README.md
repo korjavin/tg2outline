@@ -56,6 +56,24 @@ docker run --rm \
   ghcr.io/korjavin/tg2outline:latest
 ```
 
+## Portainer / GitOps deployment
+
+The repo ships a GitOps pipeline:
+
+- Push to `master` → CI builds the image and tags it with the commit SHA (no `:latest`).
+- CI then force-pushes a `deploy` branch whose `docker-compose.yml` has the image pinned to that SHA.
+- A `PORTAINER_REDEPLOY_HOOK` repo secret (Portainer stack webhook URL) triggers the redeploy.
+
+Portainer stack config:
+
+- **Repository:** `https://github.com/korjavin/tg2outline`
+- **Reference:** `refs/heads/deploy` (NOT `master`)
+- **Compose path:** `docker-compose.yml`
+- **Environment variables on the stack:** `BOT_TOKEN`, `TG_USER_ID`, `OUTLINE_URL`, `OUTLINE_API_TOKEN`, `OUTLINE_COLLECTION_ID`
+- **Webhook:** enable, copy the URL into the `PORTAINER_REDEPLOY_HOOK` GitHub secret at https://github.com/korjavin/tg2outline/settings/secrets/actions
+
+Each deployed container is traceable to an exact commit via the SHA tag.
+
 ## How it works
 
 1. The bot polls Telegram for new messages from the authorized user.
