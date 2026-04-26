@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
+	"sort"
 	"strings"
 	"time"
 )
@@ -134,15 +137,27 @@ func (c *OutlineClient) UploadAttachment(name, contentType string, data []byte) 
 		return "", fmt.Errorf("decode attachments.create response: %w", err)
 	}
 
-	// Build multipart body: form fields first, file last (S3 requires this order).
+	formKeys := make([]string, 0, len(presign.Data.Form))
+	for k := range presign.Data.Form {
+		formKeys = append(formKeys, k)
+	}
+	sort.Strings(formKeys)
+	log.Printf("attachments.create ok: uploadUrl=%s formFields=%v attachmentURL=%s",
+		presign.Data.UploadURL, formKeys, presign.Data.Attachment.URL)
+
+	// Build multipart body: form fields first, file last (S3 enforces this order
+	// and Outline's local-storage upload handler matches the same shape).
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
-	for k, v := range presign.Data.Form {
-		if err := writer.WriteField(k, v); err != nil {
+	for _, k := range formKeys {
+		if err := writer.WriteField(k, presign.Data.Form[k]); err != nil {
 			return "", fmt.Errorf("write form field %s: %w", k, err)
 		}
 	}
-	part, err := writer.CreateFormFile("file", name)
+	fileHeader := make(textproto.MIMEHeader)
+	fileHeader.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename=%q`, name))
+	fileHeader.Set("Content-Type", contentType)
+	part, err := writer.CreatePart(fileHeader)
 	if err != nil {
 		return "", fmt.Errorf("create file part: %w", err)
 	}
@@ -163,8 +178,9 @@ func (c *OutlineClient) UploadAttachment(name, contentType string, data []byte) 
 		return "", fmt.Errorf("build upload request: %w", err)
 	}
 	uploadReq.Header.Set("Content-Type", writer.FormDataContentType())
-	// Outline's local file storage requires the API token; S3 ignores it.
-	uploadReq.Header.Set("Authorization", "Bearer "+c.token)
+	// Auth is already encoded in the signed `key` field returned by
+	// attachments.create. Adding Authorization on top of it makes Outline's
+	// local-storage upload handler return 500.
 
 	uploadResp, err := c.httpClient.Do(uploadReq)
 	if err != nil {
@@ -174,7 +190,8 @@ func (c *OutlineClient) UploadAttachment(name, contentType string, data []byte) 
 
 	if uploadResp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(uploadResp.Body)
-		return "", fmt.Errorf("upload status %d: %s", uploadResp.StatusCode, strings.TrimSpace(string(raw)))
+		return "", fmt.Errorf("upload status %d to %s: %s",
+			uploadResp.StatusCode, uploadURL, strings.TrimSpace(string(raw)))
 	}
 
 	attachmentURL := presign.Data.Attachment.URL
