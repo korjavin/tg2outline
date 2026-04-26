@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -55,7 +57,10 @@ func main() {
 
 // processMessage turns a Telegram message into a single Outline document.
 func processMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, outline *OutlineClient, collectionID string) {
-	messageText := message.Text
+	// rawText is plain text (used for the title); messageText carries
+	// entity-derived markdown (links, bold, etc.) for the document body.
+	rawText := message.Text
+	messageText := entitiesToMarkdown(message.Text, message.Entities)
 	var forwardInfo string
 	var imageMarkdown string
 
@@ -98,7 +103,11 @@ func processMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, outline *Ou
 		if messageText != "" {
 			messageText += "\n\n"
 		}
-		messageText += message.Caption
+		messageText += entitiesToMarkdown(message.Caption, message.CaptionEntities)
+		if rawText != "" {
+			rawText += "\n\n"
+		}
+		rawText += message.Caption
 	}
 
 	if messageText == "" && imageMarkdown == "" && forwardInfo == "" {
@@ -120,7 +129,7 @@ func processMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, outline *Ou
 	}
 	body := strings.Join(bodyParts, "\n\n")
 
-	title := generateTitle(messageText, imageMarkdown != "")
+	title := generateTitle(rawText, imageMarkdown != "")
 
 	if _, err := outline.CreateDocument(collectionID, title, body); err != nil {
 		log.Printf("Failed to create document in Outline: %v", err)
@@ -137,6 +146,69 @@ func processMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, outline *Ou
 	reply := tgbotapi.NewMessage(message.Chat.ID, confirmation)
 	reply.ReplyToMessageID = message.MessageID
 	bot.Send(reply)
+}
+
+// entitiesToMarkdown overlays Telegram message entities onto the raw text and
+// returns markdown — preserving links, bold/italic/code, etc. that would
+// otherwise be lost. Entity offsets are in UTF-16 code units (per Telegram's
+// Bot API), so we convert to a UTF-16 buffer before slicing.
+func entitiesToMarkdown(text string, entities []tgbotapi.MessageEntity) string {
+	if text == "" || len(entities) == 0 {
+		return text
+	}
+	units := utf16.Encode([]rune(text))
+
+	es := make([]tgbotapi.MessageEntity, len(entities))
+	copy(es, entities)
+	sort.SliceStable(es, func(i, j int) bool {
+		if es[i].Offset != es[j].Offset {
+			return es[i].Offset < es[j].Offset
+		}
+		return es[i].Length > es[j].Length
+	})
+
+	var b strings.Builder
+	cursor := 0
+	for _, e := range es {
+		if e.Offset < cursor || e.Offset > len(units) {
+			// Overlapping/nested or out-of-range entity — skip.
+			continue
+		}
+		end := e.Offset + e.Length
+		if end > len(units) {
+			end = len(units)
+		}
+		b.WriteString(string(utf16.Decode(units[cursor:e.Offset])))
+		inner := string(utf16.Decode(units[e.Offset:end]))
+		b.WriteString(applyEntity(e, inner))
+		cursor = end
+	}
+	if cursor < len(units) {
+		b.WriteString(string(utf16.Decode(units[cursor:])))
+	}
+	return b.String()
+}
+
+func applyEntity(e tgbotapi.MessageEntity, inner string) string {
+	switch e.Type {
+	case "text_link":
+		return fmt.Sprintf("[%s](%s)", inner, e.URL)
+	case "bold":
+		return "**" + inner + "**"
+	case "italic":
+		return "_" + inner + "_"
+	case "code":
+		return "`" + inner + "`"
+	case "pre":
+		lang := e.Language
+		return "\n```" + lang + "\n" + inner + "\n```\n"
+	case "strikethrough":
+		return "~~" + inner + "~~"
+	default:
+		// url, mention, hashtag, email, phone_number, etc. — text already
+		// contains the visible value, so leave it untouched.
+		return inner
+	}
 }
 
 // generateTitle picks the first non-empty line of the message, trimmed to 80 chars.
