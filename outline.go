@@ -178,9 +178,9 @@ func (c *OutlineClient) UploadAttachment(name, contentType string, data []byte) 
 		return "", fmt.Errorf("build upload request: %w", err)
 	}
 	uploadReq.Header.Set("Content-Type", writer.FormDataContentType())
-	// Auth is already encoded in the signed `key` field returned by
-	// attachments.create. Adding Authorization on top of it makes Outline's
-	// local-storage upload handler return 500.
+	// /api/files.create requires Bearer auth; the signed `key` form field
+	// alone is not sufficient.
+	uploadReq.Header.Set("Authorization", "Bearer "+c.token)
 
 	uploadResp, err := c.httpClient.Do(uploadReq)
 	if err != nil {
