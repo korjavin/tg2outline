@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -46,6 +47,58 @@ type createDocumentResponse struct {
 	} `json:"data"`
 }
 
+// doWithRetry executes build() and retries on HTTP 429 with exponential backoff
+// (capped at 30s), honoring a Retry-After header when present. The caller owns
+// the returned response body. build() is called once per attempt so it can
+// produce a fresh request body each time.
+func (c *OutlineClient) doWithRetry(label string, build func() (*http.Request, error)) (*http.Response, error) {
+	const maxAttempts = 6
+	backoff := time.Second
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := build()
+		if err != nil {
+			return nil, fmt.Errorf("build %s request: %w", label, err)
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", label, err)
+		}
+		if resp.StatusCode != http.StatusTooManyRequests || attempt == maxAttempts {
+			return resp, nil
+		}
+		wait := backoff
+		if hinted := parseRetryAfter(resp.Header.Get("Retry-After")); hinted > 0 {
+			wait = hinted
+		}
+		resp.Body.Close()
+		log.Printf("%s rate limited (attempt %d/%d), retrying in %s", label, attempt, maxAttempts, wait)
+		time.Sleep(wait)
+		backoff *= 2
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+	}
+	return nil, fmt.Errorf("%s: exhausted retries", label)
+}
+
+// parseRetryAfter accepts the two Retry-After forms (delay seconds or HTTP date)
+// and returns the duration to wait, or 0 if unparseable.
+func parseRetryAfter(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(h); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
 // CreateDocument publishes a new document into the given collection and returns its ID.
 func (c *OutlineClient) CreateDocument(collectionID, title, text string) (string, error) {
 	body, err := json.Marshal(createDocumentRequest{
@@ -58,17 +111,18 @@ func (c *OutlineClient) CreateDocument(collectionID, title, text string) (string
 		return "", fmt.Errorf("marshal documents.create: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.baseURL+"/api/documents.create", bytes.NewReader(body))
+	resp, err := c.doWithRetry("documents.create", func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", c.baseURL+"/api/documents.create", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		return req, nil
+	})
 	if err != nil {
-		return "", fmt.Errorf("build documents.create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("documents.create: %w", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 
@@ -113,17 +167,18 @@ func (c *OutlineClient) UploadAttachment(name, contentType string, data []byte) 
 		return "", fmt.Errorf("marshal attachments.create: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.baseURL+"/api/attachments.create", bytes.NewReader(reqBody))
+	resp, err := c.doWithRetry("attachments.create", func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", c.baseURL+"/api/attachments.create", bytes.NewReader(reqBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		return req, nil
+	})
 	if err != nil {
-		return "", fmt.Errorf("build attachments.create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("attachments.create: %w", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 
@@ -173,16 +228,19 @@ func (c *OutlineClient) UploadAttachment(name, contentType string, data []byte) 
 		uploadURL = c.baseURL + uploadURL
 	}
 
-	uploadReq, err := http.NewRequest("POST", uploadURL, &buf)
-	if err != nil {
-		return "", fmt.Errorf("build upload request: %w", err)
-	}
-	uploadReq.Header.Set("Content-Type", writer.FormDataContentType())
-	// /api/files.create requires Bearer auth; the signed `key` form field
-	// alone is not sufficient.
-	uploadReq.Header.Set("Authorization", "Bearer "+c.token)
-
-	uploadResp, err := c.httpClient.Do(uploadReq)
+	multipartBody := buf.Bytes()
+	multipartContentType := writer.FormDataContentType()
+	uploadResp, err := c.doWithRetry("files.create", func() (*http.Request, error) {
+		uploadReq, err := http.NewRequest("POST", uploadURL, bytes.NewReader(multipartBody))
+		if err != nil {
+			return nil, err
+		}
+		uploadReq.Header.Set("Content-Type", multipartContentType)
+		// /api/files.create requires Bearer auth; the signed `key` form field
+		// alone is not sufficient.
+		uploadReq.Header.Set("Authorization", "Bearer "+c.token)
+		return uploadReq, nil
+	})
 	if err != nil {
 		return "", fmt.Errorf("upload to %s: %w", uploadURL, err)
 	}
