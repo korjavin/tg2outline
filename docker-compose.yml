@@ -3,7 +3,7 @@ version: "3.8"
 services:
   tg2outline:
     # Image tag is replaced with the commit SHA in the deploy branch by CI.
-    image: ghcr.io/korjavin/tg2outline:latest
+    image: ghcr.io/korjavin/tg2outline:29dc4c7f8c6df2363ec39d39d3825a65bcd06cfe
     container_name: tg2outline
     restart: unless-stopped
     environment:
